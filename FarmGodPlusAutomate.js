@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.6 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
+// FarmGod+ v2.7.7 – Report-Fetch-Debug / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2679,10 +2679,31 @@ const fgWallbreakerStatusLabel = function (status) {
           if (data.farms && data.farms.farms) delete data.farms.farms[coord];
 
           const storedWallKnown = Number.isFinite(parseInt(old.lastWallLevel, 10));
-          const needsWallReinspection = old.lastReportDefUnits === 0 &&
-            row.wallLevel === null && !storedWallKnown && old.status === 'needs_scout';
+          const defenderCountKnownZero = Number(old.lastReportDefUnits) === 0;
+          const wallStillUnknown = row.wallLevel === null && !storedWallKnown;
+          const needsWallReinspection = defenderCountKnownZero && wallStillUnknown && old.status === 'needs_scout';
 
-          if (row.reportId && (row.reportId !== old.lastInspectedReportId || needsWallReinspection)) {
+          // Temporärer Diagnose-Haken: Bei Verlustzielen immer sichtbar protokollieren,
+          // ob FarmGod überhaupt eine Report-ID / Detail-URL gefunden hat.
+          fgReportDebugLog(
+            'Ziel ' + coord +
+            ' · Zeile erkannt ✓' +
+            ' · Report-ID ' + (row.reportId || '?') +
+            ' · Report-Link ' + (row.reportHref ? '✓' : '✗') +
+            ' · FA-Mauer ' + (row.wallLevel === null ? '?' : row.wallLevel) +
+            ' · gespeicherte Mauer ' + (storedWallKnown ? parseInt(old.lastWallLevel, 10) : '?') +
+            ' · gespeicherte Verteidiger ' + (old.lastReportDefUnits == null ? '?' : old.lastReportDefUnits)
+          );
+
+          // Solange die Mauer trotz 0 Verteidigern unbekannt ist, laden wir den Bericht
+          // für die Diagnose bewusst erneut – auch wenn es derselbe Report wie zuvor ist.
+          const shouldFetchReport = !!(row.reportId && row.reportHref && (
+            row.reportId !== old.lastInspectedReportId ||
+            needsWallReinspection ||
+            wallStillUnknown
+          ));
+
+          if (shouldFetchReport) {
             reportChecks.push(
               fgFetchLifecycleReportInfo(row).then(function (info) {
                 old.lastInspectedReportId = row.reportId;
@@ -3991,7 +4012,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.6</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.7</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
