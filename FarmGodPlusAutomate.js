@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.2 – Ziel-Lebenszyklus + verbesserte Mauer-Erkennung / Simulations-Autopilot
+// FarmGod+ v2.7.3 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2260,6 +2260,33 @@ window.FarmGod.Main = (function (Library, Translation) {
         candidates.push({ level: level, source: source });
       };
 
+      // Klassische Gebäude-Tabelle im Bericht: z. B. <td>Wall</td><td>9</td>.
+      // Die deutsche Spieloberfläche kann das Gebäude trotz deutscher UI als "Wall" ausgeben.
+      root.find('tr').each(function () {
+        const $row = $(this);
+        const $cells = $row.find('td,th');
+        if ($cells.length < 2) return;
+
+        for (let i = 0; i < $cells.length - 1; i++) {
+          const buildingText = $cells.eq(i).text().replace(/\s+/g, ' ').trim();
+          if (!/^(?:wall|mauer)$/i.test(buildingText)) continue;
+
+          const levelText = $cells.eq(i + 1).text().trim();
+          const match = levelText.match(/\d{1,2}/);
+          if (match) add(match[0], 'report-building-table');
+        }
+      });
+
+      // Zusätzlich Tabellenzellen prüfen, falls Icon/Name und Stufe in verschachtelten Elementen stehen.
+      root.find('td').each(function () {
+        const $cell = $(this);
+        const text = $cell.text().replace(/\s+/g, ' ').trim();
+        if (!/^(?:wall|mauer)$/i.test(text)) return;
+        const $next = $cell.next('td');
+        const match = $next.text().match(/\d{1,2}/);
+        if (match) add(match[0], 'report-building-cell');
+      });
+
       // Moderne/strukturierte Report-Varianten.
       root.find('[data-building="wall"], [data-building-name="wall"], [data-building="building_wall"]').each(function () {
         const $el = $(this);
@@ -3917,7 +3944,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.2</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.3</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
