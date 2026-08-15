@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.5 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
+// FarmGod+ v2.7.6 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -1224,7 +1224,7 @@ window.FarmGod.Main = (function (Library, Translation) {
   
   const fgReportDebugLog = function (message) {
     try {
-      if (typeof fgSimLog === 'function') fgSimLog('🧪 Report-Debug · ' + message);
+      if (typeof fgSimulationAddLog === 'function') fgSimulationAddLog('🧪 Report-Debug · ' + message);
       else console.log('FarmGod+ Report-Debug:', message);
     } catch (e) {
       console.log('FarmGod+ Report-Debug:', message);
@@ -3991,7 +3991,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.5</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.6</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
