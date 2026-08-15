@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.0 – Ziel-Lebenszyklus / Simulations-Autopilot
+// FarmGod+ v2.7.1 – Ziel-Lebenszyklus + Mauer-Cleaner / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2178,6 +2178,8 @@ window.FarmGod.Main = (function (Library, Translation) {
   const fgLifecycleStatusLabel = function (status) {
     if (status === 'needs_scout') return '🔎 Späherprüfung nötig';
     if (status === 'armed_bb') return '🛡️ BB mit Truppen';
+    if (status === 'needs_wallbreaker') return '🔨 Mauer-Cleaner nötig';
+    if (status === 'wall_waiting_report') return '🟣 Mauer-Cleaner simuliert';
     if (status === 'not_barbarian') return '🚫 kein BB mehr';
     if (status === 'safe') return '✅ farmbar';
     return '❔ unbekannt';
@@ -2215,12 +2217,17 @@ window.FarmGod.Main = (function (Library, Translation) {
         targetId = parseInt(fgGetUrlParam('target', $action.attr('href') || ''), 10);
       }
 
+      const wallText = $cells.length > 6 ? $cells.eq(6).text().trim() : '';
+      const wallLevel = /^\d+$/.test(wallText) ? parseInt(wallText, 10) : null;
+
       result[coord] = {
         coord: coord,
         targetId: Number.isFinite(targetId) ? targetId : null,
         color: color,
         reportId: Number.isFinite(reportId) ? reportId : null,
         reportHref: href,
+        wall: wallText,
+        wallLevel: wallLevel,
         loss: color === 'yellow' || color === 'red' || color === 'red_blue'
       };
     });
@@ -2334,11 +2341,126 @@ window.FarmGod.Main = (function (Library, Translation) {
     };
   };
 
+
+  const fgLifecycleActiveWallbreakerRecords = function (state) {
+    const nowSec = Math.round(lib.getCurrentServerTime() / 1000);
+    const records = Array.isArray(state.wallbreakerCommands) ? state.wallbreakerCommands : [];
+    const active = records.filter(function (x) {
+      return x && Number(x.returnAt || 0) > nowSec;
+    });
+    state.wallbreakerCommands = active;
+    return active;
+  };
+
+  const fgLifecycleWallbreakerTravel = function (originCoord, targetCoord, units) {
+    const speeds = lib.getUnitSpeeds() || {};
+    const used = Object.keys(units || {}).filter(function (unit) {
+      return (parseInt(units[unit], 10) || 0) > 0;
+    });
+    let slowest = 0;
+    used.forEach(function (unit) {
+      slowest = Math.max(slowest, Number(speeds[unit]) || 0);
+    });
+    if (!slowest) slowest = Number(speeds.ram) || 30;
+
+    const distance = fgDistanceCoords(originCoord, targetCoord);
+    const nowSec = Math.round(lib.getCurrentServerTime() / 1000);
+    const oneWay = Math.round(distance * slowest * 60);
+    return {
+      distance: distance,
+      arrivalAt: nowSec + oneWay,
+      returnAt: nowSec + oneWay * 2
+    };
+  };
+
+  const fgLifecycleBuildAvailableWallbreakerTroops = function (ownVillages, state) {
+    const reserve = fgGetTroopReserve();
+    const activeWalls = fgLifecycleActiveWallbreakerRecords(state);
+    const activeScouts = fgLifecycleActiveScoutRecords(state);
+    const reserved = {};
+
+    const ensure = function (id) {
+      if (!reserved[id]) reserved[id] = { axe: 0, ram: 0, spy: 0 };
+      return reserved[id];
+    };
+
+    activeWalls.forEach(function (entry) {
+      const r = ensure(entry.originId);
+      r.axe += parseInt(entry.units && entry.units.axe, 10) || 0;
+      r.ram += parseInt(entry.units && entry.units.ram, 10) || 0;
+      r.spy += parseInt(entry.units && entry.units.spy, 10) || 0;
+    });
+    activeScouts.forEach(function (entry) {
+      ensure(entry.originId).spy += 1;
+    });
+
+    return ownVillages.map(function (v) {
+      const r = reserved[v.id] || { axe: 0, ram: 0, spy: 0 };
+      return {
+        village: v,
+        available: {
+          axe: Math.max(0, (parseInt(v.units.axe, 10) || 0) - (reserve.enabled ? reserve.axe : 0) - r.axe),
+          ram: Math.max(0, (parseInt(v.units.ram, 10) || 0) - (reserve.enabled ? reserve.ram : 0) - r.ram),
+          spy: Math.max(0, (parseInt(v.units.spy, 10) || 0) - (reserve.enabled ? reserve.spy : 0) - r.spy)
+        }
+      };
+    });
+  };
+
+  const fgLifecycleAssignWallbreaker = function (target, ownVillages, state) {
+    const need = fgGetWallbreakerUnits(target.wallLevel);
+    const pools = fgLifecycleBuildAvailableWallbreakerTroops(ownVillages, state);
+    const candidates = pools.filter(function (entry) {
+      return fgCanSupplyWallbreaker(entry.available, need);
+    }).map(function (entry) {
+      return {
+        village: entry.village,
+        available: entry.available,
+        distance: fgDistanceCoords(entry.village.coord, target.coord)
+      };
+    }).sort(function (a, b) {
+      return a.distance - b.distance;
+    });
+
+    return candidates.length ? {
+      village: candidates[0].village,
+      distance: candidates[0].distance,
+      units: need
+    } : null;
+  };
+
+  const fgApplyLifecycleWallbreakerReservations = function (data, state) {
+    const active = fgLifecycleActiveWallbreakerRecords(state);
+    if (!active.length) return;
+
+    const filteredUnits = game_data.units.filter(function (unit) {
+      return ['ram', 'catapult', 'knight', 'snob', 'militia'].indexOf(unit) === -1;
+    });
+    const axeIndex = filteredUnits.indexOf('axe');
+    const spyIndex = filteredUnits.indexOf('spy');
+
+    active.forEach(function (entry) {
+      const village = data.villages && data.villages[entry.originCoord];
+      if (!village || !Array.isArray(village.units)) return;
+      if (axeIndex >= 0) village.units[axeIndex] = Math.max(
+        0,
+        (parseInt(village.units[axeIndex], 10) || 0) - (parseInt(entry.units && entry.units.axe, 10) || 0)
+      );
+      if (spyIndex >= 0) village.units[spyIndex] = Math.max(
+        0,
+        (parseInt(village.units[spyIndex], 10) || 0) - (parseInt(entry.units && entry.units.spy, 10) || 0)
+      );
+      // Rammen sind im normalen Farm-Datensatz absichtlich nicht enthalten.
+      // Sie werden hier nur über die separate Dorfübersicht bei der Cleaner-Zuteilung reserviert.
+    });
+  };
+
   const fgRunTargetLifecycleSimulation = function (pages, data) {
     const rows = fgParseLifecycleRows(pages);
     const lifecycle = fgReadTargetLifecycle();
     lifecycle.targets = lifecycle.targets && typeof lifecycle.targets === 'object' ? lifecycle.targets : {};
     lifecycle.scoutCommands = Array.isArray(lifecycle.scoutCommands) ? lifecycle.scoutCommands : [];
+    lifecycle.wallbreakerCommands = Array.isArray(lifecycle.wallbreakerCommands) ? lifecycle.wallbreakerCommands : [];
     const targets = lifecycle.targets;
     const now = Date.now();
     const summary = {
@@ -2346,7 +2468,9 @@ window.FarmGod.Main = (function (Library, Translation) {
       removed: 0,
       lossTargets: 0,
       armed: 0,
+      wallTargets: 0,
       scoutPlanned: [],
+      wallbreakersPlanned: [],
       released: 0
     };
 
@@ -2361,6 +2485,8 @@ window.FarmGod.Main = (function (Library, Translation) {
         old.targetId = row.targetId || old.targetId || (world && world.id) || null;
         old.lastSeenAt = now;
         old.lastColor = row.color;
+        old.lastWallText = row.wall;
+        if (row.wallLevel !== null) old.lastWallLevel = row.wallLevel;
 
         if (!isBarbarian) {
           old.status = 'not_barbarian';
@@ -2374,8 +2500,19 @@ window.FarmGod.Main = (function (Library, Translation) {
 
         if (row.loss) {
           summary.lossTargets++;
-          old.status = old.status === 'armed_bb' ? 'armed_bb' : 'needs_scout';
           old.lossDetectedAt = old.lossDetectedAt || now;
+
+          // Wenn derselbe Bericht bereits als "Mauer-Cleaner simuliert" behandelt wurde,
+          // warten wir auf einen neuen Bericht / eine neue Mauerinformation und schicken
+          // in der Simulation nicht bei jedem Refresh noch einen Cleaner.
+          if (old.status === 'wall_waiting_report' &&
+              row.reportId && row.reportId === old.wallbreakerSourceReportId) {
+            targets[coord] = old;
+            if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+            return;
+          }
+
+          old.status = old.status === 'armed_bb' ? 'armed_bb' : 'needs_scout';
           old.updatedAt = now;
           old.nextCheckAt = old.status === 'armed_bb'
             ? (old.nextCheckAt || now)
@@ -2388,10 +2525,28 @@ window.FarmGod.Main = (function (Library, Translation) {
               fgFetchLifecycleReportInfo(row).then(function (info) {
                 old.lastInspectedReportId = row.reportId;
                 old.lastReportDefUnits = info.known ? info.total : null;
-                if (info.known && info.total > 0) {
+
+                if (!info.known) {
+                  old.status = 'needs_scout';
+                  old.nextCheckAt = now;
+                } else if (info.total > 0) {
                   old.status = 'armed_bb';
                   old.nextCheckAt = now;
                   old.armedDetectedAt = now;
+                } else if (row.wallLevel !== null && row.wallLevel > 0) {
+                  old.status = 'needs_wallbreaker';
+                  old.wallLevel = row.wallLevel;
+                  old.nextCheckAt = now;
+                } else if (row.wallLevel === 0) {
+                  old.status = 'safe';
+                  old.nextCheckAt = null;
+                  old.lastSafeReportId = row.reportId;
+                  summary.released++;
+                } else {
+                  // Bericht kennt 0 Verteidiger, aber die Mauer ist nicht sicher lesbar.
+                  // In diesem Fall lieber einmal ausspähen statt blind zu cleanen.
+                  old.status = 'needs_scout';
+                  old.nextCheckAt = now;
                 }
                 old.updatedAt = Date.now();
               })
@@ -2401,7 +2556,10 @@ window.FarmGod.Main = (function (Library, Translation) {
         }
 
         // Ein neuer, verlustfreier Bericht kann ein zuvor gesperrtes Ziel wieder freigeben.
-        if ((old.status === 'needs_scout' || old.status === 'armed_bb') &&
+        if ((old.status === 'needs_scout' ||
+             old.status === 'armed_bb' ||
+             old.status === 'needs_wallbreaker' ||
+             old.status === 'wall_waiting_report') &&
             row.reportId && row.reportId !== old.lastSafeReportId && row.color === 'green') {
           old.status = 'safe';
           old.lastSafeReportId = row.reportId;
@@ -2420,23 +2578,37 @@ window.FarmGod.Main = (function (Library, Translation) {
         Object.keys(targets).forEach(function (coord) {
           const item = targets[coord];
           if (!item) return;
-          if (item.status === 'not_barbarian' || item.status === 'needs_scout' || item.status === 'armed_bb') {
+          if (item.status === 'not_barbarian' ||
+              item.status === 'needs_scout' ||
+              item.status === 'armed_bb' ||
+              item.status === 'needs_wallbreaker' ||
+              item.status === 'wall_waiting_report') {
             if (data.farms && data.farms.farms) delete data.farms.farms[coord];
             summary.blocked++;
             if (item.status === 'armed_bb') summary.armed++;
+            if (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_report') summary.wallTargets++;
           }
         });
 
         fgApplyLifecycleScoutReservations(data, lifecycle);
+        fgApplyLifecycleWallbreakerReservations(data, lifecycle);
 
-        const dueTargets = Object.keys(targets).map(function (coord) {
+        const dueScouts = Object.keys(targets).map(function (coord) {
           return targets[coord];
         }).filter(function (item) {
           if (!item || (item.status !== 'needs_scout' && item.status !== 'armed_bb')) return false;
           return !item.nextCheckAt || item.nextCheckAt <= now;
         });
 
-        if (!dueTargets.length) {
+        const dueWalls = Object.keys(targets).map(function (coord) {
+          return targets[coord];
+        }).filter(function (item) {
+          return item && item.status === 'needs_wallbreaker' &&
+            Number.isFinite(parseInt(item.wallLevel, 10)) &&
+            parseInt(item.wallLevel, 10) > 0;
+        });
+
+        if (!dueScouts.length && !dueWalls.length) {
           lifecycle.targets = targets;
           lifecycle.updatedAt = Date.now();
           fgWriteTargetLifecycle(lifecycle);
@@ -2444,7 +2616,46 @@ window.FarmGod.Main = (function (Library, Translation) {
         }
 
         return fgFetchOwnVillageTroops().then(function (ownVillages) {
-          dueTargets.forEach(function (item) {
+          // Erst Mauer-Cleaner reservieren, danach Scouts. So kann ein bekannter
+          // Mauerfall nicht aus Versehen seine Rammen/Axt/Späher an normale Checks verlieren.
+          dueWalls.forEach(function (item) {
+            const chosen = fgLifecycleAssignWallbreaker(item, ownVillages, lifecycle);
+            if (!chosen) {
+              item.lastWallbreakerError = 'nicht genug Axt/Rammen/Späher verfügbar';
+              item.updatedAt = Date.now();
+              return;
+            }
+
+            const travel = fgLifecycleWallbreakerTravel(chosen.village.coord, item.coord, chosen.units);
+            lifecycle.wallbreakerCommands.push({
+              targetId: item.targetId,
+              targetCoord: item.coord,
+              originId: chosen.village.id,
+              originCoord: chosen.village.coord,
+              wallLevel: parseInt(item.wallLevel, 10),
+              units: chosen.units,
+              arrivalAt: travel.arrivalAt,
+              returnAt: travel.returnAt,
+              simulatedAt: Math.round(lib.getCurrentServerTime() / 1000),
+              sourceReportId: item.lastInspectedReportId || null
+            });
+
+            item.status = 'wall_waiting_report';
+            item.lastWallbreakerAt = now;
+            item.wallbreakerSourceReportId = item.lastInspectedReportId || null;
+            item.updatedAt = Date.now();
+
+            summary.wallbreakersPlanned.push({
+              coord: item.coord,
+              originCoord: chosen.village.coord,
+              distance: travel.distance,
+              arrivalAt: travel.arrivalAt,
+              wallLevel: parseInt(item.wallLevel, 10),
+              units: chosen.units
+            });
+          });
+
+          dueScouts.forEach(function (item) {
             const chosen = fgLifecycleAssignScout(item, ownVillages, lifecycle);
             if (!chosen) {
               item.lastScoutError = 'kein Späher verfügbar';
@@ -2478,8 +2689,9 @@ window.FarmGod.Main = (function (Library, Translation) {
             });
           });
 
-          // Die soeben simulierten Späher müssen dem aktuellen Farmplan bereits fehlen.
+          // Die soeben simulierten Sonderaktionen müssen dem aktuellen Farmplan bereits fehlen.
           fgApplyLifecycleScoutReservations(data, lifecycle);
+          fgApplyLifecycleWallbreakerReservations(data, lifecycle);
           lifecycle.targets = targets;
           lifecycle.updatedAt = Date.now();
           fgWriteTargetLifecycle(lifecycle);
@@ -2495,9 +2707,20 @@ window.FarmGod.Main = (function (Library, Translation) {
       'Zielpflege · gesperrt ' + summary.blocked +
       ' · Verlust-BBs ' + summary.lossTargets +
       ' · bewaffnete BBs ' + summary.armed +
+      ' · Mauerziele ' + (summary.wallTargets || 0) +
       ' · kein BB mehr ' + summary.removed +
       ' · wieder freigegeben ' + summary.released
     );
+
+    (summary.wallbreakersPlanned || []).forEach(function (item, index) {
+      fgSimulationAddLog(
+        '  🔨 #' + (index + 1) + ' · Mauer-Cleaner · Mauer ' + item.wallLevel +
+        ' · ' + item.originCoord + ' → ' + item.coord +
+        ' · ' + item.distance.toFixed(2) + ' Felder · ' +
+        item.units.axe + ' Axt / ' + item.units.ram + ' Rammen / ' + item.units.spy + ' Späher' +
+        ' · Ankunft ' + fgSimulationFormatArrival(item.arrivalAt)
+      );
+    });
 
     (summary.scoutPlanned || []).forEach(function (item, index) {
       const reason = item.reason === 'armed_bb' ? 'Recheck bewaffnetes BB' : 'Verlust prüfen';
@@ -3596,7 +3819,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.0</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.1</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
