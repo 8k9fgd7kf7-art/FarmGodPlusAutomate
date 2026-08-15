@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.9 – Report-Fetch-Debug / Simulations-Autopilot
+// FarmGod+ v2.8.0 – Report-Fetch-Debug / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2219,6 +2219,7 @@ const fgWallbreakerStatusLabel = function (status) {
     if (status === 'needs_scout') return '🔎 Späherprüfung nötig';
     if (status === 'armed_bb') return '🛡️ BB mit Truppen';
     if (status === 'needs_wallbreaker') return '🔨 Mauer-Cleaner nötig';
+    if (status === 'wall_waiting_troops') return '🟠 Mauerziel – wartet auf Truppen';
     if (status === 'wall_waiting_report') return '🟣 Mauer-Cleaner simuliert';
     if (status === 'not_barbarian') return '🚫 kein BB mehr';
     if (status === 'safe') return '✅ farmbar';
@@ -2719,7 +2720,7 @@ const fgWallbreakerStatusLabel = function (status) {
             : (storedWallKnown ? parseInt(old.lastWallLevel, 10) : null);
 
           // WICHTIG: Bekannter Verlustbericht mit 0 Verteidigern + sicher bekannter Mauer
-          // muss direkt in den Mauer-Cleaner-Zweig. In v2.7.9 wurde vorher pauschal
+          // muss direkt in den Mauer-Cleaner-Zweig. In v2.8.0 wurde vorher pauschal
           // needs_scout gesetzt; bei bereits bekanntem Bericht wurde dieser danach nicht
           // erneut geladen, sodass der Cleaner-Zweig nie erreicht werden konnte.
           if (defenderCountKnownZero && Number.isFinite(knownWallLevel)) {
@@ -2764,6 +2765,7 @@ const fgWallbreakerStatusLabel = function (status) {
           // Solange die Mauer trotz 0 Verteidigern unbekannt ist, laden wir den Bericht
           // für die Diagnose bewusst erneut – auch wenn es derselbe Report wie zuvor ist.
           const shouldFetchReport = !!(old.status !== 'needs_wallbreaker' &&
+            old.status !== 'wall_waiting_troops' &&
             old.status !== 'safe' && row.reportId && row.reportHref && (
               row.reportId !== old.lastInspectedReportId ||
               needsWallReinspection ||
@@ -2817,6 +2819,7 @@ const fgWallbreakerStatusLabel = function (status) {
         if ((old.status === 'needs_scout' ||
              old.status === 'armed_bb' ||
              old.status === 'needs_wallbreaker' ||
+             old.status === 'wall_waiting_troops' ||
              old.status === 'wall_waiting_report') &&
             row.reportId && row.reportId !== old.lastSafeReportId && row.color === 'green') {
           old.status = 'safe';
@@ -2840,11 +2843,12 @@ const fgWallbreakerStatusLabel = function (status) {
               item.status === 'needs_scout' ||
               item.status === 'armed_bb' ||
               item.status === 'needs_wallbreaker' ||
+              item.status === 'wall_waiting_troops' ||
               item.status === 'wall_waiting_report') {
             if (data.farms && data.farms.farms) delete data.farms.farms[coord];
             summary.blocked++;
             if (item.status === 'armed_bb') summary.armed++;
-            if (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_report') summary.wallTargets++;
+            if (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_troops' || item.status === 'wall_waiting_report') summary.wallTargets++;
           }
         });
 
@@ -2861,7 +2865,8 @@ const fgWallbreakerStatusLabel = function (status) {
         const dueWalls = Object.keys(targets).map(function (coord) {
           return targets[coord];
         }).filter(function (item) {
-          return item && item.status === 'needs_wallbreaker' &&
+          return item && (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_troops') &&
+            (!item.nextCheckAt || item.nextCheckAt <= now) &&
             Number.isFinite(parseInt(item.wallLevel, 10)) &&
             parseInt(item.wallLevel, 10) > 0;
         });
@@ -2881,8 +2886,10 @@ const fgWallbreakerStatusLabel = function (status) {
             if (!chosen) {
               const diagnostic = fgLifecycleDiagnoseWallbreaker(item, ownVillages, lifecycle);
               summary.wallbreakerDiagnostics.push(diagnostic);
+              item.status = 'wall_waiting_troops';
               item.lastWallbreakerError = 'nicht genug Axt/Rammen/Späher verfügbar';
               item.lastWallbreakerDiagnostic = diagnostic;
+              item.nextCheckAt = now + 2 * 60 * 1000;
               item.updatedAt = Date.now();
               return;
             }
@@ -2908,6 +2915,7 @@ const fgWallbreakerStatusLabel = function (status) {
             });
 
             item.status = 'wall_waiting_report';
+            item.nextCheckAt = null;
             item.lastWallbreakerAt = now;
             item.wallbreakerSourceReportId = item.lastInspectedReportId || null;
             item.updatedAt = Date.now();
@@ -2982,24 +2990,30 @@ const fgWallbreakerStatusLabel = function (status) {
 
     (summary.wallbreakerDiagnostics || []).forEach(function (diag) {
       const need = diag.need || { axe: 0, ram: 0, spy: 0 };
-      fgSimulationAddLog(
-        '  🧪 Cleaner-Diagnose · Ziel ' + diag.coord + ' · Mauer ' + diag.wallLevel +
-        ' · benötigt ' + need.axe + ' Axt / ' + need.ram + ' Rammen / ' + need.spy + ' Späher' +
-        ' · eigene Dörfer geprüft ' + (diag.villagesChecked || 0) +
-        (diag.selectedOrigin ? ' · gewählt ' + diag.selectedOrigin : ' · KEIN passendes Dorf')
-      );
-      (diag.candidates || []).forEach(function (candidate, index) {
-        const av = candidate.available || { axe: 0, ram: 0, spy: 0 };
-        const mi = candidate.missing || { axe: 0, ram: 0, spy: 0 };
+      const candidates = diag.candidates || [];
+      if (diag.selectedOrigin) {
         fgSimulationAddLog(
-          '    ↳ Kandidat #' + (index + 1) + ' · ' + candidate.coord +
-          ' · ' + candidate.distance.toFixed(2) + ' Felder' +
-          ' · verfügbar ' + av.axe + ' Axt / ' + av.ram + ' Rammen / ' + av.spy + ' Späher' +
-          (candidate.possible
-            ? ' · ✅ ausreichend'
-            : ' · ❌ fehlt ' + mi.axe + ' Axt / ' + mi.ram + ' Rammen / ' + mi.spy + ' Späher')
+          '  🧪 Cleaner-Diagnose · Ziel ' + diag.coord + ' · Mauer ' + diag.wallLevel +
+          ' · benötigt ' + need.axe + ' Axt / ' + need.ram + ' Rammen / ' + need.spy + ' Späher' +
+          ' · gewählt ' + diag.selectedOrigin
         );
-      });
+        return;
+      }
+
+      const best = candidates.length ? candidates[0] : null;
+      if (best) {
+        const av = best.available || { axe: 0, ram: 0, spy: 0 };
+        fgSimulationAddLog(
+          '  🔨 ' + diag.coord + ' · Mauer ' + diag.wallLevel + ' · wartet auf Truppen' +
+          ' · bester Stand: ' + av.axe + '/' + need.axe + ' Axt · ' +
+          av.ram + '/' + need.ram + ' Rammen · ' + av.spy + '/' + need.spy + ' Späher' +
+          ' · Dorf ' + best.coord
+        );
+      } else {
+        fgSimulationAddLog(
+          '  🔨 ' + diag.coord + ' · Mauer ' + diag.wallLevel + ' · wartet auf Truppen · keine eigenen Dörfer lesbar'
+        );
+      }
     });
 
     (summary.wallbreakersPlanned || []).forEach(function (item, index) {
@@ -4110,7 +4124,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.9</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.8.0</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
