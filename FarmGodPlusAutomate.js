@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.8 – Report-Fetch-Debug / Simulations-Autopilot
+// FarmGod+ v2.7.9 – Report-Fetch-Debug / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2587,6 +2587,46 @@ const fgWallbreakerStatusLabel = function (status) {
     } : null;
   };
 
+
+  const fgLifecycleDiagnoseWallbreaker = function (target, ownVillages, state) {
+    const need = fgGetWallbreakerUnits(target.wallLevel);
+    const pools = fgLifecycleBuildAvailableWallbreakerTroops(ownVillages, state)
+      .map(function (entry) {
+        const av = entry.available || { axe: 0, ram: 0, spy: 0 };
+        const missing = {
+          axe: Math.max(0, need.axe - (parseInt(av.axe, 10) || 0)),
+          ram: Math.max(0, need.ram - (parseInt(av.ram, 10) || 0)),
+          spy: Math.max(0, need.spy - (parseInt(av.spy, 10) || 0))
+        };
+        return {
+          coord: entry.village.coord,
+          name: entry.village.name || entry.village.coord,
+          distance: fgDistanceCoords(entry.village.coord, target.coord),
+          available: {
+            axe: parseInt(av.axe, 10) || 0,
+            ram: parseInt(av.ram, 10) || 0,
+            spy: parseInt(av.spy, 10) || 0
+          },
+          missing: missing,
+          possible: missing.axe === 0 && missing.ram === 0 && missing.spy === 0,
+          shortageScore: missing.axe + missing.ram * 10 + missing.spy * 50
+        };
+      })
+      .sort(function (a, b) {
+        if (a.possible !== b.possible) return a.possible ? -1 : 1;
+        if (a.shortageScore !== b.shortageScore) return a.shortageScore - b.shortageScore;
+        return a.distance - b.distance;
+      });
+
+    return {
+      coord: target.coord,
+      wallLevel: parseInt(target.wallLevel, 10) || 0,
+      need: need,
+      villagesChecked: pools.length,
+      candidates: pools.slice(0, 6)
+    };
+  };
+
   const fgApplyLifecycleWallbreakerReservations = function (data, state) {
     const active = fgLifecycleActiveWallbreakerRecords(state);
     if (!active.length) return;
@@ -2629,6 +2669,7 @@ const fgWallbreakerStatusLabel = function (status) {
       wallTargets: 0,
       scoutPlanned: [],
       wallbreakersPlanned: [],
+      wallbreakerDiagnostics: [],
       released: 0
     };
 
@@ -2678,7 +2719,7 @@ const fgWallbreakerStatusLabel = function (status) {
             : (storedWallKnown ? parseInt(old.lastWallLevel, 10) : null);
 
           // WICHTIG: Bekannter Verlustbericht mit 0 Verteidigern + sicher bekannter Mauer
-          // muss direkt in den Mauer-Cleaner-Zweig. In v2.7.8 wurde vorher pauschal
+          // muss direkt in den Mauer-Cleaner-Zweig. In v2.7.9 wurde vorher pauschal
           // needs_scout gesetzt; bei bereits bekanntem Bericht wurde dieser danach nicht
           // erneut geladen, sodass der Cleaner-Zweig nie erreicht werden konnte.
           if (defenderCountKnownZero && Number.isFinite(knownWallLevel)) {
@@ -2838,10 +2879,19 @@ const fgWallbreakerStatusLabel = function (status) {
           dueWalls.forEach(function (item) {
             const chosen = fgLifecycleAssignWallbreaker(item, ownVillages, lifecycle);
             if (!chosen) {
+              const diagnostic = fgLifecycleDiagnoseWallbreaker(item, ownVillages, lifecycle);
+              summary.wallbreakerDiagnostics.push(diagnostic);
               item.lastWallbreakerError = 'nicht genug Axt/Rammen/Späher verfügbar';
+              item.lastWallbreakerDiagnostic = diagnostic;
               item.updatedAt = Date.now();
               return;
             }
+
+            const successDiagnostic = fgLifecycleDiagnoseWallbreaker(item, ownVillages, lifecycle);
+            successDiagnostic.selectedOrigin = chosen.village.coord;
+            successDiagnostic.selectedDistance = chosen.distance;
+            successDiagnostic.possible = true;
+            summary.wallbreakerDiagnostics.push(successDiagnostic);
 
             const travel = fgLifecycleWallbreakerTravel(chosen.village.coord, item.coord, chosen.units);
             lifecycle.wallbreakerCommands.push({
@@ -2929,6 +2979,28 @@ const fgWallbreakerStatusLabel = function (status) {
       ' · kein BB mehr ' + summary.removed +
       ' · wieder freigegeben ' + summary.released
     );
+
+    (summary.wallbreakerDiagnostics || []).forEach(function (diag) {
+      const need = diag.need || { axe: 0, ram: 0, spy: 0 };
+      fgSimulationAddLog(
+        '  🧪 Cleaner-Diagnose · Ziel ' + diag.coord + ' · Mauer ' + diag.wallLevel +
+        ' · benötigt ' + need.axe + ' Axt / ' + need.ram + ' Rammen / ' + need.spy + ' Späher' +
+        ' · eigene Dörfer geprüft ' + (diag.villagesChecked || 0) +
+        (diag.selectedOrigin ? ' · gewählt ' + diag.selectedOrigin : ' · KEIN passendes Dorf')
+      );
+      (diag.candidates || []).forEach(function (candidate, index) {
+        const av = candidate.available || { axe: 0, ram: 0, spy: 0 };
+        const mi = candidate.missing || { axe: 0, ram: 0, spy: 0 };
+        fgSimulationAddLog(
+          '    ↳ Kandidat #' + (index + 1) + ' · ' + candidate.coord +
+          ' · ' + candidate.distance.toFixed(2) + ' Felder' +
+          ' · verfügbar ' + av.axe + ' Axt / ' + av.ram + ' Rammen / ' + av.spy + ' Späher' +
+          (candidate.possible
+            ? ' · ✅ ausreichend'
+            : ' · ❌ fehlt ' + mi.axe + ' Axt / ' + mi.ram + ' Rammen / ' + mi.spy + ' Späher')
+        );
+      });
+    });
 
     (summary.wallbreakersPlanned || []).forEach(function (item, index) {
       fgSimulationAddLog(
@@ -4038,7 +4110,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.8</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.9</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
