@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.3 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
+// FarmGod+ v2.7.4 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -1221,7 +1221,47 @@ window.FarmGod.Main = (function (Library, Translation) {
     return reservations;
   };
 
-  const fgWallbreakerStatusLabel = function (status) {
+  
+  const fgReportDebugLog = function (message) {
+    try {
+      if (typeof fgSimLog === 'function') fgSimLog('🧪 Report-Debug · ' + message);
+      else console.log('FarmGod+ Report-Debug:', message);
+    } catch (e) {
+      console.log('FarmGod+ Report-Debug:', message);
+    }
+  };
+
+  const fgDebugReportHtml = function (reportId, html, targetCoord) {
+    try {
+      const text = typeof html === 'string' ? html : String(html || '');
+      const $doc = $( $.parseHTML(text, document, true) || [] );
+      const fullText = $doc.text();
+      const hasSpy = /Spionage|Espionage|spy/i.test(fullText);
+      const hasBuildings = /Gebäude|Buildings/i.test(fullText);
+      const wallTextMatch = fullText.match(/(?:Wall|Mauer)\s*(?:Stufe|Level)?\s*(\d{1,2})/i);
+      let wallFromTable = null;
+      $doc.find('tr').each(function () {
+        const rowText = $(this).text().replace(/\s+/g, ' ').trim();
+        const m = rowText.match(/(?:Wall|Mauer).*?(\d{1,2})/i);
+        if (m && wallFromTable === null) wallFromTable = parseInt(m[1],10);
+      });
+      const wall = wallFromTable !== null ? wallFromTable : (wallTextMatch ? parseInt(wallTextMatch[1],10) : null);
+      fgReportDebugLog(
+        'Ziel ' + (targetCoord || '?') +
+        ' · Report-ID ' + (reportId || '?') +
+        ' · Detailseite geladen ' + (text.length > 500 ? '✓' : '✗') +
+        ' · Spionage ' + (hasSpy ? '✓' : '✗') +
+        ' · Gebäudedaten ' + (hasBuildings ? '✓' : '✗') +
+        ' · Wall gefunden ' + (wall !== null ? ('✓ ('+wall+')') : '✗')
+      );
+      return wall;
+    } catch (e) {
+      fgReportDebugLog('Fehler beim Auswerten von Report ' + (reportId || '?') + ': ' + e.message);
+      return null;
+    }
+  };
+
+const fgWallbreakerStatusLabel = function (status) {
     if (status === 'prepared') return '🔵 vorbereitet';
     if (status === 'waiting_report') return '🟣 wartet auf neue Daten';
     if (status === 'needs_replan') return '🔄 neu planen';
@@ -2848,6 +2888,7 @@ window.FarmGod.Main = (function (Library, Translation) {
     });
 
     (summary.scoutPlanned || []).forEach(function (item, index) {
+        fgReportDebugLog('Verlust-BB ohne erkannte Mauer · Ziel ' + (target.coord || targetCoord || coord || '?') + ' · Verteidiger 0');
       const reason = item.reason === 'armed_bb' ? 'Recheck bewaffnetes BB' : 'Verlust prüfen';
       const troops = item.knownDefUnits != null ? ' · Bericht: ' + item.knownDefUnits + ' Verteidiger' : '';
       fgSimulationAddLog(
@@ -3944,7 +3985,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.3</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.4</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
