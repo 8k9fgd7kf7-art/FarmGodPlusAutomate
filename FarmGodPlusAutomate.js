@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.4 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
+// FarmGod+ v2.7.5 – Ziel-Lebenszyklus + Wall-Tabellenerkennung / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2412,8 +2412,15 @@ const fgWallbreakerStatusLabel = function (status) {
       return Promise.resolve({ known: false, total: null, wallKnown: false, wallLevel: null, wallSource: null });
     }
     return $.get(row.reportHref).then(function (html) {
+      // Diagnose direkt an der tatsächlich geladenen Report-Detailseite.
+      fgDebugReportHtml(row.reportId, html, row.coord);
       return fgParseReportDefenderUnits(html);
-    }).catch(function () {
+    }).catch(function (error) {
+      fgReportDebugLog(
+        'Ziel ' + (row.coord || '?') +
+        ' · Report-ID ' + (row.reportId || '?') +
+        ' · Detailseite laden ✗ · ' + ((error && error.status) ? ('HTTP ' + error.status) : 'Abruf fehlgeschlagen')
+      );
       return { known: false, total: null, wallKnown: false, wallLevel: null, wallSource: null };
     });
   };
@@ -2888,7 +2895,6 @@ const fgWallbreakerStatusLabel = function (status) {
     });
 
     (summary.scoutPlanned || []).forEach(function (item, index) {
-        fgReportDebugLog('Verlust-BB ohne erkannte Mauer · Ziel ' + (target.coord || targetCoord || coord || '?') + ' · Verteidiger 0');
       const reason = item.reason === 'armed_bb' ? 'Recheck bewaffnetes BB' : 'Verlust prüfen';
       const troops = item.knownDefUnits != null ? ' · Bericht: ' + item.knownDefUnits + ' Verteidiger' : '';
       fgSimulationAddLog(
@@ -3985,7 +3991,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.4</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.5</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
