@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.7 – Report-Fetch-Debug / Simulations-Autopilot
+// FarmGod+ v2.7.8 – Report-Fetch-Debug / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2670,16 +2670,41 @@ const fgWallbreakerStatusLabel = function (status) {
             return;
           }
 
-          old.status = old.status === 'armed_bb' ? 'armed_bb' : 'needs_scout';
+          const storedWallKnown = Number.isFinite(parseInt(old.lastWallLevel, 10));
+          const defenderCountKnownZero = Number(old.lastReportDefUnits) === 0;
+          const rowWallKnown = Number.isFinite(parseInt(row.wallLevel, 10));
+          const knownWallLevel = rowWallKnown
+            ? parseInt(row.wallLevel, 10)
+            : (storedWallKnown ? parseInt(old.lastWallLevel, 10) : null);
+
+          // WICHTIG: Bekannter Verlustbericht mit 0 Verteidigern + sicher bekannter Mauer
+          // muss direkt in den Mauer-Cleaner-Zweig. In v2.7.8 wurde vorher pauschal
+          // needs_scout gesetzt; bei bereits bekanntem Bericht wurde dieser danach nicht
+          // erneut geladen, sodass der Cleaner-Zweig nie erreicht werden konnte.
+          if (defenderCountKnownZero && Number.isFinite(knownWallLevel)) {
+            if (knownWallLevel > 0) {
+              old.status = 'needs_wallbreaker';
+              old.wallLevel = knownWallLevel;
+              old.resolvedWallLevel = knownWallLevel;
+              old.resolvedWallSource = rowWallKnown ? 'farm_assistent' : (old.lastWallSource || 'gespeichert');
+              old.nextCheckAt = now;
+            } else {
+              old.status = 'safe';
+              old.nextCheckAt = null;
+              old.lastSafeReportId = row.reportId || old.lastSafeReportId || null;
+              summary.released++;
+            }
+          } else {
+            old.status = old.status === 'armed_bb' ? 'armed_bb' : 'needs_scout';
+            old.nextCheckAt = old.status === 'armed_bb'
+              ? (old.nextCheckAt || now)
+              : Math.min(old.nextCheckAt || now, now);
+          }
+
           old.updatedAt = now;
-          old.nextCheckAt = old.status === 'armed_bb'
-            ? (old.nextCheckAt || now)
-            : Math.min(old.nextCheckAt || now, now);
           targets[coord] = old;
           if (data.farms && data.farms.farms) delete data.farms.farms[coord];
 
-          const storedWallKnown = Number.isFinite(parseInt(old.lastWallLevel, 10));
-          const defenderCountKnownZero = Number(old.lastReportDefUnits) === 0;
           const wallStillUnknown = row.wallLevel === null && !storedWallKnown;
           const needsWallReinspection = defenderCountKnownZero && wallStillUnknown && old.status === 'needs_scout';
 
@@ -2697,11 +2722,12 @@ const fgWallbreakerStatusLabel = function (status) {
 
           // Solange die Mauer trotz 0 Verteidigern unbekannt ist, laden wir den Bericht
           // für die Diagnose bewusst erneut – auch wenn es derselbe Report wie zuvor ist.
-          const shouldFetchReport = !!(row.reportId && row.reportHref && (
-            row.reportId !== old.lastInspectedReportId ||
-            needsWallReinspection ||
-            wallStillUnknown
-          ));
+          const shouldFetchReport = !!(old.status !== 'needs_wallbreaker' &&
+            old.status !== 'safe' && row.reportId && row.reportHref && (
+              row.reportId !== old.lastInspectedReportId ||
+              needsWallReinspection ||
+              wallStillUnknown
+            ));
 
           if (shouldFetchReport) {
             reportChecks.push(
@@ -4012,7 +4038,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.7</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.8</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
