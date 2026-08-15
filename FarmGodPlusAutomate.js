@@ -1,4 +1,4 @@
-// FarmGod+ v2.7.1 – Ziel-Lebenszyklus + Mauer-Cleaner / Simulations-Autopilot
+// FarmGod+ v2.7.2 – Ziel-Lebenszyklus + verbesserte Mauer-Erkennung / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2249,35 +2249,119 @@ window.FarmGod.Main = (function (Library, Translation) {
     });
   };
 
+  const fgParseReportWallLevel = function (html, $doc) {
+    try {
+      const root = $doc || $($.parseHTML(html, document, true) || []);
+      const candidates = [];
+
+      const add = function (value, source) {
+        const level = parseInt(value, 10);
+        if (!Number.isFinite(level) || level < 0 || level > 30) return;
+        candidates.push({ level: level, source: source });
+      };
+
+      // Moderne/strukturierte Report-Varianten.
+      root.find('[data-building="wall"], [data-building-name="wall"], [data-building="building_wall"]').each(function () {
+        const $el = $(this);
+        add($el.attr('data-level') || $el.data('level') || ($el.text().match(/\d+/) || [])[0], 'report-data');
+      });
+
+      root.find('[id*="wall"], [class*="wall"]').each(function () {
+        const $el = $(this);
+        const text = $el.text().trim();
+        const match = text.match(/(?:^|\D)(\d{1,2})(?:\D|$)/);
+        if (match) add(match[1], 'report-wall-node');
+      });
+
+      // Klassische Berichte enthalten häufig ein Gebäude-Icon building_wall.png.
+      root.find('img[src*="building_wall"], img[src*="wall.png"], img[src*="wall.webp"]').each(function () {
+        const $img = $(this);
+        const probes = [
+          $img.closest('tr').text(),
+          $img.closest('td').text(),
+          $img.parent().text(),
+          $img.attr('title') || '',
+          $img.attr('alt') || ''
+        ];
+        probes.forEach(function (text) {
+          const nums = String(text || '').match(/\d{1,2}/g) || [];
+          if (nums.length) add(nums[nums.length - 1], 'report-wall-icon');
+        });
+      });
+
+      // Letzter Fallback direkt im HTML rund um eindeutige wall/building_wall-Marker.
+      const raw = String(html || '');
+      const regexes = [
+        /building_wall[^>]{0,250}>[\s\S]{0,180}?(?:level|stufe|niveau|poziom|nivel)?[^0-9]{0,30}(\d{1,2})/ig,
+        /(?:data-building|building)[^>]{0,80}["']wall["'][^>]{0,180}(?:data-level=["']?(\d{1,2})|>[^<]*?(\d{1,2}))/ig
+      ];
+      regexes.forEach(function (re) {
+        let m;
+        while ((m = re.exec(raw)) !== null) add(m[1] || m[2], 'report-html');
+      });
+
+      if (!candidates.length) return { known: false, level: null, source: null };
+      // Bevorzugt den ersten strukturierten Treffer. Die Kandidaten sind absichtlich
+      // in absteigender Verlässlichkeit gesammelt.
+      return { known: true, level: candidates[0].level, source: candidates[0].source };
+    } catch (e) {
+      return { known: false, level: null, source: null };
+    }
+  };
+
   const fgParseReportDefenderUnits = function (html) {
     try {
       const doc = $.parseHTML(html, document, true) || [];
       const $doc = $(doc);
       let $row = $doc.find('#attack_info_def_units').first();
       if (!$row.length) $row = $doc.find('tr[id*="def"][id*="unit"], tr[class*="def"][class*="unit"]').first();
-      if (!$row.length) return { known: false, total: null };
 
       let total = 0;
       let seen = 0;
-      $row.find('td.unit-item, td').each(function () {
-        const txt = $(this).text().replace(/\./g, '').replace(/\s/g, '');
-        if (!/^\d+$/.test(txt)) return;
-        total += parseInt(txt, 10) || 0;
-        seen++;
-      });
-      return { known: seen > 0, total: total };
+      if ($row.length) {
+        $row.find('td.unit-item, td').each(function () {
+          const txt = $(this).text().replace(/\./g, '').replace(/\s/g, '');
+          if (!/^\d+$/.test(txt)) return;
+          total += parseInt(txt, 10) || 0;
+          seen++;
+        });
+      }
+
+      const wall = fgParseReportWallLevel(html, $doc);
+      return {
+        known: seen > 0,
+        total: seen > 0 ? total : null,
+        wallKnown: !!wall.known,
+        wallLevel: wall.known ? wall.level : null,
+        wallSource: wall.source || null
+      };
     } catch (e) {
-      return { known: false, total: null };
+      return { known: false, total: null, wallKnown: false, wallLevel: null, wallSource: null };
     }
   };
 
   const fgFetchLifecycleReportInfo = function (row) {
-    if (!row || !row.reportHref || !row.reportId) return Promise.resolve({ known: false, total: null });
+    if (!row || !row.reportHref || !row.reportId) {
+      return Promise.resolve({ known: false, total: null, wallKnown: false, wallLevel: null, wallSource: null });
+    }
     return $.get(row.reportHref).then(function (html) {
       return fgParseReportDefenderUnits(html);
     }).catch(function () {
-      return { known: false, total: null };
+      return { known: false, total: null, wallKnown: false, wallLevel: null, wallSource: null };
     });
+  };
+
+  const fgResolveLifecycleWallLevel = function (row, old, reportInfo) {
+    if (row && Number.isFinite(parseInt(row.wallLevel, 10))) {
+      return { known: true, level: parseInt(row.wallLevel, 10), source: 'farm-assistent' };
+    }
+    if (reportInfo && reportInfo.wallKnown && Number.isFinite(parseInt(reportInfo.wallLevel, 10))) {
+      return { known: true, level: parseInt(reportInfo.wallLevel, 10), source: reportInfo.wallSource || 'bericht' };
+    }
+    if (old && Number.isFinite(parseInt(old.lastWallLevel, 10))) {
+      return { known: true, level: parseInt(old.lastWallLevel, 10), source: 'gespeicherter-zielstatus' };
+    }
+    return { known: false, level: null, source: null };
   };
 
   const fgFarmUnitIndex = function (unit) {
@@ -2520,11 +2604,23 @@ window.FarmGod.Main = (function (Library, Translation) {
           targets[coord] = old;
           if (data.farms && data.farms.farms) delete data.farms.farms[coord];
 
-          if (row.reportId && row.reportId !== old.lastInspectedReportId) {
+          const storedWallKnown = Number.isFinite(parseInt(old.lastWallLevel, 10));
+          const needsWallReinspection = old.lastReportDefUnits === 0 &&
+            row.wallLevel === null && !storedWallKnown && old.status === 'needs_scout';
+
+          if (row.reportId && (row.reportId !== old.lastInspectedReportId || needsWallReinspection)) {
             reportChecks.push(
               fgFetchLifecycleReportInfo(row).then(function (info) {
                 old.lastInspectedReportId = row.reportId;
                 old.lastReportDefUnits = info.known ? info.total : null;
+                if (info.wallKnown) {
+                  old.lastWallLevel = info.wallLevel;
+                  old.lastWallSource = info.wallSource || 'bericht';
+                }
+
+                const wall = fgResolveLifecycleWallLevel(row, old, info);
+                old.resolvedWallLevel = wall.known ? wall.level : null;
+                old.resolvedWallSource = wall.source;
 
                 if (!info.known) {
                   old.status = 'needs_scout';
@@ -2533,18 +2629,18 @@ window.FarmGod.Main = (function (Library, Translation) {
                   old.status = 'armed_bb';
                   old.nextCheckAt = now;
                   old.armedDetectedAt = now;
-                } else if (row.wallLevel !== null && row.wallLevel > 0) {
+                } else if (wall.known && wall.level > 0) {
                   old.status = 'needs_wallbreaker';
-                  old.wallLevel = row.wallLevel;
+                  old.wallLevel = wall.level;
                   old.nextCheckAt = now;
-                } else if (row.wallLevel === 0) {
+                } else if (wall.known && wall.level === 0) {
                   old.status = 'safe';
                   old.nextCheckAt = null;
                   old.lastSafeReportId = row.reportId;
                   summary.released++;
                 } else {
-                  // Bericht kennt 0 Verteidiger, aber die Mauer ist nicht sicher lesbar.
-                  // In diesem Fall lieber einmal ausspähen statt blind zu cleanen.
+                  // 0 Verteidiger, aber auch nach Farm-Assistent + Bericht + gespeichertem
+                  // Zielstatus keine sichere Mauerstufe: erst dann bleibt der Scout-Fallback.
                   old.status = 'needs_scout';
                   old.nextCheckAt = now;
                 }
@@ -2651,7 +2747,8 @@ window.FarmGod.Main = (function (Library, Translation) {
               distance: travel.distance,
               arrivalAt: travel.arrivalAt,
               wallLevel: parseInt(item.wallLevel, 10),
-              units: chosen.units
+              units: chosen.units,
+              wallSource: item.resolvedWallSource || item.lastWallSource || 'unbekannt'
             });
           });
 
@@ -2718,6 +2815,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         ' · ' + item.originCoord + ' → ' + item.coord +
         ' · ' + item.distance.toFixed(2) + ' Felder · ' +
         item.units.axe + ' Axt / ' + item.units.ram + ' Rammen / ' + item.units.spy + ' Späher' +
+        ' · Mauerquelle ' + (item.wallSource || 'unbekannt') +
         ' · Ankunft ' + fgSimulationFormatArrival(item.arrivalAt)
       );
     });
@@ -3819,7 +3917,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.1</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.2</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
