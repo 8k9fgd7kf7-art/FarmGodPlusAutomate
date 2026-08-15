@@ -1,4 +1,4 @@
-// FarmGod+ v2.6.0 – GitHub / Schnellleisten build
+// FarmGod+ v2.6.1 – GitHub / Schnellleisten build
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2190,8 +2190,69 @@ window.FarmGod.Main = (function (Library, Translation) {
     const stamp = new Date(lib.getCurrentServerTime());
     const clock = String(stamp.getHours()).padStart(2, '0') + ':' +
       String(stamp.getMinutes()).padStart(2, '0') + ':' + String(stamp.getSeconds()).padStart(2, '0');
+    // Während der Diagnosephase bleibt das vollständige Protokoll erhalten.
     fgSimulationSession.log.unshift(clock + ' · ' + text);
-    fgSimulationSession.log = fgSimulationSession.log.slice(0, 30);
+  };
+
+  const fgSimulationCopyLog = function () {
+    const text = (fgSimulationSession.log || []).join('\n');
+    if (!text) {
+      UI.ErrorMessage('Das Simulationsprotokoll ist noch leer.');
+      return;
+    }
+
+    const success = function () {
+      UI.SuccessMessage('Vollständiges Simulationsprotokoll kopiert.', 1400);
+    };
+
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      navigator.clipboard.writeText(text).then(success).catch(function () {
+        const $tmp = $('<textarea>').val(text).css({ position: 'fixed', left: '-9999px', top: '-9999px' }).appendTo('body');
+        $tmp[0].select();
+        try {
+          document.execCommand('copy');
+          success();
+        } catch (e) {
+          UI.ErrorMessage('Protokoll konnte nicht automatisch kopiert werden.');
+        }
+        $tmp.remove();
+      });
+      return;
+    }
+
+    const $tmp = $('<textarea>').val(text).css({ position: 'fixed', left: '-9999px', top: '-9999px' }).appendTo('body');
+    $tmp[0].select();
+    try {
+      document.execCommand('copy');
+      success();
+    } catch (e) {
+      UI.ErrorMessage('Protokoll konnte nicht automatisch kopiert werden.');
+    }
+    $tmp.remove();
+  };
+
+  const fgSimulationFormatArrival = function (timestamp) {
+    if (!Number.isFinite(Number(timestamp))) return '–';
+    const d = new Date(Number(timestamp) * 1000);
+    return String(d.getHours()).padStart(2, '0') + ':' +
+      String(d.getMinutes()).padStart(2, '0') + ':' +
+      String(d.getSeconds()).padStart(2, '0');
+  };
+
+  const fgSimulationLogDiagnostics = function (plan, activeRecordCount) {
+    const stats = plan.stats || {};
+    const comparison = plan.comparison || {};
+    const source = comparison.source === 'legacy-fallback' ? 'alter Plan (Fallback)' : 'Optimierer';
+    const parts = [
+      'Planquelle: ' + source,
+      'Zeitkonflikte ' + (parseInt(stats.time, 10) || 0),
+      'Truppen ' + (parseInt(stats.troops, 10) || 0),
+      'Distanz ' + (parseInt(stats.distance, 10) || 0),
+      'Rückkehr ' + (parseInt(stats.returnTime, 10) || 0),
+      'Ankunft ' + (parseInt(stats.arrivalTime, 10) || 0),
+      'simulierte Ankünfte aktiv ' + (parseInt(activeRecordCount, 10) || 0)
+    ];
+    fgSimulationAddLog('Diagnose · ' + parts.join(' · '));
   };
 
   const fgRenderSimulationPanel = function () {
@@ -2213,7 +2274,10 @@ window.FarmGod.Main = (function (Library, Translation) {
     const html = '<div class="vis fgSimulationPanel" style="margin:0 0 10px;border:2px solid #6f4b27;background:#fff7e8;">' +
       '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:9px 11px;background:#6f4b27;color:#fff;">' +
         '<div><b>🧪 FarmGod+ Simulations-Autopilot</b><div style="font-size:10px;opacity:.9;">Es werden keine echten Angriffe abgeschickt.</div></div>' +
-        '<button type="button" class="btn fgSimulationStop"' + (active ? '' : ' disabled') + '>Simulation stoppen</button>' +
+        '<div style="display:flex;gap:6px;align-items:center;">' +
+          '<button type="button" class="btn fgSimulationCopy">📋 Protokoll kopieren</button>' +
+          '<button type="button" class="btn fgSimulationStop"' + (active ? '' : ' disabled') + '>Simulation stoppen</button>' +
+        '</div>' +
       '</div>' +
       '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:7px;padding:10px;">' +
         '<div style="text-align:center;background:#fff;border:1px solid #c9a976;padding:7px;"><b style="font-size:17px;display:block;">' + fgSimulationSession.cycles + '</b>Prüfungen</div>' +
@@ -2227,6 +2291,10 @@ window.FarmGod.Main = (function (Library, Translation) {
         '<div style="margin-top:6px;max-height:120px;overflow:auto;padding:6px 8px;background:#fff;border:1px solid #d6bd91;line-height:1.45;">' + logs + '</div></div>' +
       '</div>';
     $('#am_widget_Farm').first().before(html);
+
+    $('.fgSimulationCopy').off('click.farmGodSim').on('click.farmGodSim', function () {
+      fgSimulationCopyLog();
+    });
 
     $('.fgSimulationStop').off('click.farmGodSim').on('click.farmGodSim', function () {
       fgStopSimulation();
@@ -2291,6 +2359,8 @@ window.FarmGod.Main = (function (Library, Translation) {
         );
 
         const records = fgSimulationRecords();
+        const recordsBefore = records.length;
+        const attackDetails = [];
         let count = 0;
         Object.keys(plan.farms || {}).forEach(function (coord) {
           (plan.farms[coord] || []).forEach(function (item) {
@@ -2303,6 +2373,13 @@ window.FarmGod.Main = (function (Library, Translation) {
               templateName: item.template.name,
               arrival: item.arrival,
               simulatedAt: Math.round(lib.getCurrentServerTime() / 1000)
+            });
+            attackDetails.push({
+              originCoord: item.origin.coord,
+              targetCoord: item.target.coord,
+              templateName: item.template.name,
+              fields: item.fields,
+              arrival: item.arrival
             });
             count++;
           });
@@ -2322,6 +2399,20 @@ window.FarmGod.Main = (function (Library, Translation) {
         fgSimulationAddLog(count
           ? count + ' Farmangriff(e) wären jetzt abgeschickt worden.'
           : 'Aktuell kein neuer Farmangriff möglich.');
+
+        if (attackDetails.length) {
+          attackDetails.forEach(function (item, index) {
+            const templateLabel = String(item.templateName || '?').toUpperCase();
+            const fields = Number.isFinite(Number(item.fields)) ? Number(item.fields).toFixed(2) : '–';
+            fgSimulationAddLog(
+              '  ↳ #' + (index + 1) + ' · Vorlage ' + templateLabel +
+              ' · ' + item.originCoord + ' → ' + item.targetCoord +
+              ' · ' + fields + ' Felder · Ankunft ' + fgSimulationFormatArrival(item.arrival)
+            );
+          });
+        }
+
+        fgSimulationLogDiagnostics(plan, recordsBefore + count);
         if (smartCleanup && (smartCleanup.clearedScouts || smartCleanup.clearedWalls || smartCleanup.changedWalls)) {
           fgSimulationAddLog('Gesamtplan aktualisiert: ' + fgBuildSmartRefreshMessage(smartCleanup));
         }
@@ -4438,6 +4529,7 @@ window.FarmGod.Main = (function (Library, Translation) {
           target: { coord: el.coord, id: farmIndex.id },
           fields: distance,
           template: { name: templateName, id: template.id },
+          arrival: arrival,
         });
 
         data.villages[prop].units = unitsLeft;
