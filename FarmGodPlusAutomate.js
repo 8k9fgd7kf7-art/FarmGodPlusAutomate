@@ -1,4 +1,4 @@
-// FarmGod+ v2.6.1 – GitHub / Schnellleisten build
+// FarmGod+ v2.7.0 – Ziel-Lebenszyklus / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -2149,6 +2149,368 @@ window.FarmGod.Main = (function (Library, Translation) {
       });
   };
 
+
+  // ---------------------------------------------------------------------------
+  // Ziel-Lebenszyklus für den Simulations-Autopiloten
+  // ---------------------------------------------------------------------------
+  const FG_TARGET_RECHECK_MS = 6 * 60 * 60 * 1000;      // bewaffnete BBs: 6 h
+  const FG_TARGET_SCOUT_RETRY_MS = 30 * 60 * 1000;      // unklare Verluste: 30 min
+  const FG_WORLD_CACHE_MS = 5 * 60 * 1000;
+  let fgWorldVillageCache = { loadedAt: 0, byCoord: {} };
+
+  const fgTargetLifecycleKey = function () {
+    return 'farmGod_target_lifecycle_' + game_data.world + '_' + game_data.player.id;
+  };
+
+  const fgReadTargetLifecycle = function () {
+    try {
+      const value = JSON.parse(localStorage.getItem(fgTargetLifecycleKey()) || '{}');
+      return value && typeof value === 'object' ? value : {};
+    } catch (e) {
+      return {};
+    }
+  };
+
+  const fgWriteTargetLifecycle = function (state) {
+    localStorage.setItem(fgTargetLifecycleKey(), JSON.stringify(state || {}));
+  };
+
+  const fgLifecycleStatusLabel = function (status) {
+    if (status === 'needs_scout') return '🔎 Späherprüfung nötig';
+    if (status === 'armed_bb') return '🛡️ BB mit Truppen';
+    if (status === 'not_barbarian') return '🚫 kein BB mehr';
+    if (status === 'safe') return '✅ farmbar';
+    return '❔ unbekannt';
+  };
+
+  const fgParseLifecycleRows = function (pages) {
+    let rowsHtml = '';
+    (pages || []).forEach(function (page) {
+      if (page && page.plunder_list !== undefined) rowsHtml += page.plunder_list;
+      else if (typeof page === 'string') rowsHtml += page;
+    });
+
+    const result = {};
+    const coordRegex = /[0-9]{1,3}\|[0-9]{1,3}/;
+    ($.parseHTML(rowsHtml) || []).forEach(function (node) {
+      const $row = $(node);
+      if (!$row.is('tr')) return;
+      const $cells = $row.find('td');
+      if ($cells.length < 4) return;
+
+      const $villageLink = $row.find('a[href*="screen=report"][href*="view="]').first();
+      const coordMatch = (($villageLink.text() || $row.text() || '').match(coordRegex));
+      if (!coordMatch) return;
+      const coord = coordMatch[0];
+
+      const dotSrc = $row.find('img[src*="graphic/dots/"]').first().attr('src') || '';
+      const colorMatch = dotSrc.match(/dots\/(green|yellow|red|blue|red_blue)/);
+      const color = colorMatch ? colorMatch[1] : null;
+      const href = $villageLink.attr('href') || '';
+      const reportId = parseInt(fgGetUrlParam('view', href), 10);
+
+      let targetId = parseInt(String($row.attr('id') || '').replace(/\D/g, ''), 10);
+      if (!Number.isFinite(targetId)) {
+        const $action = $row.find('a[href*="target="]').last();
+        targetId = parseInt(fgGetUrlParam('target', $action.attr('href') || ''), 10);
+      }
+
+      result[coord] = {
+        coord: coord,
+        targetId: Number.isFinite(targetId) ? targetId : null,
+        color: color,
+        reportId: Number.isFinite(reportId) ? reportId : null,
+        reportHref: href,
+        loss: color === 'yellow' || color === 'red' || color === 'red_blue'
+      };
+    });
+    return result;
+  };
+
+  const fgGetWorldVillageMap = function () {
+    const now = Date.now();
+    if (fgWorldVillageCache.loadedAt && now - fgWorldVillageCache.loadedAt < FG_WORLD_CACHE_MS) {
+      return Promise.resolve(fgWorldVillageCache.byCoord);
+    }
+    return $.get('/map/village.txt').then(function (raw) {
+      const byCoord = {};
+      parseVillageTxt(raw).forEach(function (v) {
+        byCoord[v.coord] = v;
+      });
+      fgWorldVillageCache = { loadedAt: Date.now(), byCoord: byCoord };
+      return byCoord;
+    });
+  };
+
+  const fgParseReportDefenderUnits = function (html) {
+    try {
+      const doc = $.parseHTML(html, document, true) || [];
+      const $doc = $(doc);
+      let $row = $doc.find('#attack_info_def_units').first();
+      if (!$row.length) $row = $doc.find('tr[id*="def"][id*="unit"], tr[class*="def"][class*="unit"]').first();
+      if (!$row.length) return { known: false, total: null };
+
+      let total = 0;
+      let seen = 0;
+      $row.find('td.unit-item, td').each(function () {
+        const txt = $(this).text().replace(/\./g, '').replace(/\s/g, '');
+        if (!/^\d+$/.test(txt)) return;
+        total += parseInt(txt, 10) || 0;
+        seen++;
+      });
+      return { known: seen > 0, total: total };
+    } catch (e) {
+      return { known: false, total: null };
+    }
+  };
+
+  const fgFetchLifecycleReportInfo = function (row) {
+    if (!row || !row.reportHref || !row.reportId) return Promise.resolve({ known: false, total: null });
+    return $.get(row.reportHref).then(function (html) {
+      return fgParseReportDefenderUnits(html);
+    }).catch(function () {
+      return { known: false, total: null };
+    });
+  };
+
+  const fgFarmUnitIndex = function (unit) {
+    const filtered = game_data.units.filter(function (u) {
+      return ['ram', 'catapult', 'knight', 'snob', 'militia'].indexOf(u) === -1;
+    });
+    return filtered.indexOf(unit);
+  };
+
+  const fgLifecycleActiveScoutRecords = function (state) {
+    const nowSec = Math.round(lib.getCurrentServerTime() / 1000);
+    const records = Array.isArray(state.scoutCommands) ? state.scoutCommands : [];
+    const active = records.filter(function (x) {
+      return x && Number(x.returnAt || 0) > nowSec;
+    });
+    state.scoutCommands = active;
+    return active;
+  };
+
+  const fgApplyLifecycleScoutReservations = function (data, state) {
+    const spyIndex = fgFarmUnitIndex('spy');
+    if (spyIndex < 0) return;
+    fgLifecycleActiveScoutRecords(state).forEach(function (entry) {
+      const village = data.villages && data.villages[entry.originCoord];
+      if (!village || !Array.isArray(village.units)) return;
+      village.units[spyIndex] = Math.max(0, (parseInt(village.units[spyIndex], 10) || 0) - 1);
+    });
+  };
+
+  const fgLifecycleAssignScout = function (target, ownVillages, state) {
+    const reserve = fgGetTroopReserve();
+    const active = fgLifecycleActiveScoutRecords(state);
+    const activeByOrigin = {};
+    active.forEach(function (x) {
+      activeByOrigin[x.originId] = (activeByOrigin[x.originId] || 0) + 1;
+    });
+
+    const candidates = ownVillages.filter(function (v) {
+      const total = parseInt(v.units.spy, 10) || 0;
+      const available = total - (reserve.enabled ? reserve.spy : 0) - (activeByOrigin[v.id] || 0);
+      return available > 0;
+    }).map(function (v) {
+      return { village: v, distance: fgDistanceCoords(v.coord, target.coord) };
+    }).sort(function (a, b) {
+      return a.distance - b.distance;
+    });
+
+    return candidates.length ? candidates[0] : null;
+  };
+
+  const fgLifecycleScoutTravel = function (originCoord, targetCoord) {
+    const speeds = lib.getUnitSpeeds() || {};
+    const spySpeed = Number(speeds.spy) || 9;
+    const distance = fgDistanceCoords(originCoord, targetCoord);
+    const nowSec = Math.round(lib.getCurrentServerTime() / 1000);
+    const oneWay = Math.round(distance * spySpeed * 60);
+    return {
+      distance: distance,
+      arrivalAt: nowSec + oneWay,
+      returnAt: nowSec + oneWay * 2
+    };
+  };
+
+  const fgRunTargetLifecycleSimulation = function (pages, data) {
+    const rows = fgParseLifecycleRows(pages);
+    const lifecycle = fgReadTargetLifecycle();
+    lifecycle.targets = lifecycle.targets && typeof lifecycle.targets === 'object' ? lifecycle.targets : {};
+    lifecycle.scoutCommands = Array.isArray(lifecycle.scoutCommands) ? lifecycle.scoutCommands : [];
+    const targets = lifecycle.targets;
+    const now = Date.now();
+    const summary = {
+      blocked: 0,
+      removed: 0,
+      lossTargets: 0,
+      armed: 0,
+      scoutPlanned: [],
+      released: 0
+    };
+
+    return fgGetWorldVillageMap().then(function (worldByCoord) {
+      const reportChecks = [];
+
+      Object.keys(rows).forEach(function (coord) {
+        const row = rows[coord];
+        const world = worldByCoord[coord];
+        const isBarbarian = !!world && parseInt(world.playerId, 10) === 0;
+        const old = targets[coord] || { coord: coord, createdAt: now };
+        old.targetId = row.targetId || old.targetId || (world && world.id) || null;
+        old.lastSeenAt = now;
+        old.lastColor = row.color;
+
+        if (!isBarbarian) {
+          old.status = 'not_barbarian';
+          old.nextCheckAt = null;
+          old.updatedAt = now;
+          targets[coord] = old;
+          if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+          summary.removed++;
+          return;
+        }
+
+        if (row.loss) {
+          summary.lossTargets++;
+          old.status = old.status === 'armed_bb' ? 'armed_bb' : 'needs_scout';
+          old.lossDetectedAt = old.lossDetectedAt || now;
+          old.updatedAt = now;
+          old.nextCheckAt = old.status === 'armed_bb'
+            ? (old.nextCheckAt || now)
+            : Math.min(old.nextCheckAt || now, now);
+          targets[coord] = old;
+          if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+
+          if (row.reportId && row.reportId !== old.lastInspectedReportId) {
+            reportChecks.push(
+              fgFetchLifecycleReportInfo(row).then(function (info) {
+                old.lastInspectedReportId = row.reportId;
+                old.lastReportDefUnits = info.known ? info.total : null;
+                if (info.known && info.total > 0) {
+                  old.status = 'armed_bb';
+                  old.nextCheckAt = now;
+                  old.armedDetectedAt = now;
+                }
+                old.updatedAt = Date.now();
+              })
+            );
+          }
+          return;
+        }
+
+        // Ein neuer, verlustfreier Bericht kann ein zuvor gesperrtes Ziel wieder freigeben.
+        if ((old.status === 'needs_scout' || old.status === 'armed_bb') &&
+            row.reportId && row.reportId !== old.lastSafeReportId && row.color === 'green') {
+          old.status = 'safe';
+          old.lastSafeReportId = row.reportId;
+          old.nextCheckAt = null;
+          old.updatedAt = now;
+          summary.released++;
+        } else if (!old.status || old.status === 'unknown') {
+          old.status = 'safe';
+          old.updatedAt = now;
+        }
+        targets[coord] = old;
+      });
+
+      return Promise.all(reportChecks).then(function () {
+        // Alle dauerhaft oder vorübergehend gesperrten Ziele aus dem Farmplan entfernen.
+        Object.keys(targets).forEach(function (coord) {
+          const item = targets[coord];
+          if (!item) return;
+          if (item.status === 'not_barbarian' || item.status === 'needs_scout' || item.status === 'armed_bb') {
+            if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+            summary.blocked++;
+            if (item.status === 'armed_bb') summary.armed++;
+          }
+        });
+
+        fgApplyLifecycleScoutReservations(data, lifecycle);
+
+        const dueTargets = Object.keys(targets).map(function (coord) {
+          return targets[coord];
+        }).filter(function (item) {
+          if (!item || (item.status !== 'needs_scout' && item.status !== 'armed_bb')) return false;
+          return !item.nextCheckAt || item.nextCheckAt <= now;
+        });
+
+        if (!dueTargets.length) {
+          lifecycle.targets = targets;
+          lifecycle.updatedAt = Date.now();
+          fgWriteTargetLifecycle(lifecycle);
+          return summary;
+        }
+
+        return fgFetchOwnVillageTroops().then(function (ownVillages) {
+          dueTargets.forEach(function (item) {
+            const chosen = fgLifecycleAssignScout(item, ownVillages, lifecycle);
+            if (!chosen) {
+              item.lastScoutError = 'kein Späher verfügbar';
+              item.nextCheckAt = now + 10 * 60 * 1000;
+              item.updatedAt = Date.now();
+              return;
+            }
+
+            const travel = fgLifecycleScoutTravel(chosen.village.coord, item.coord);
+            lifecycle.scoutCommands.push({
+              targetId: item.targetId,
+              targetCoord: item.coord,
+              originId: chosen.village.id,
+              originCoord: chosen.village.coord,
+              arrivalAt: travel.arrivalAt,
+              returnAt: travel.returnAt,
+              simulatedAt: Math.round(lib.getCurrentServerTime() / 1000),
+              reason: item.status
+            });
+
+            item.lastScoutAt = now;
+            item.nextCheckAt = now + (item.status === 'armed_bb' ? FG_TARGET_RECHECK_MS : FG_TARGET_SCOUT_RETRY_MS);
+            item.updatedAt = Date.now();
+            summary.scoutPlanned.push({
+              coord: item.coord,
+              originCoord: chosen.village.coord,
+              distance: travel.distance,
+              arrivalAt: travel.arrivalAt,
+              reason: item.status,
+              knownDefUnits: item.lastReportDefUnits
+            });
+          });
+
+          // Die soeben simulierten Späher müssen dem aktuellen Farmplan bereits fehlen.
+          fgApplyLifecycleScoutReservations(data, lifecycle);
+          lifecycle.targets = targets;
+          lifecycle.updatedAt = Date.now();
+          fgWriteTargetLifecycle(lifecycle);
+          return summary;
+        });
+      });
+    });
+  };
+
+  const fgSimulationLogLifecycle = function (summary) {
+    if (!summary) return;
+    fgSimulationAddLog(
+      'Zielpflege · gesperrt ' + summary.blocked +
+      ' · Verlust-BBs ' + summary.lossTargets +
+      ' · bewaffnete BBs ' + summary.armed +
+      ' · kein BB mehr ' + summary.removed +
+      ' · wieder freigegeben ' + summary.released
+    );
+
+    (summary.scoutPlanned || []).forEach(function (item, index) {
+      const reason = item.reason === 'armed_bb' ? 'Recheck bewaffnetes BB' : 'Verlust prüfen';
+      const troops = item.knownDefUnits != null ? ' · Bericht: ' + item.knownDefUnits + ' Verteidiger' : '';
+      fgSimulationAddLog(
+        '  🔎 #' + (index + 1) + ' · ' + reason +
+        ' · ' + item.originCoord + ' → ' + item.coord +
+        ' · ' + item.distance.toFixed(2) + ' Felder · Ankunft ' +
+        fgSimulationFormatArrival(item.arrivalAt) + troops
+      );
+    });
+  };
+
   const fgSimulationKey = function () {
     return 'farmGod_simulation_' + game_data.world + '_' + game_data.player.id;
   };
@@ -2340,13 +2702,22 @@ window.FarmGod.Main = (function (Library, Translation) {
     }
 
     let smartCleanup = null;
+    let sharedPages = null;
+    let lifecycleSummary = null;
     fgLoadSharedFAPages()
       .then(function (pages) {
+        sharedPages = pages;
         smartCleanup = fgSmartRefreshIntegratedPlan(pages);
         return getData(options.optionGroup, options.optionNewbarbs, options.optionLosses);
       })
       .then(function (data) {
         fgApplySimulationCommands(data);
+        return fgRunTargetLifecycleSimulation(sharedPages, data).then(function (summary) {
+          lifecycleSummary = summary;
+          return data;
+        });
+      })
+      .then(function (data) {
         const normalKey = data.farms.templates[options.optionTemplateNormal]
           ? options.optionTemplateNormal : Object.keys(data.farms.templates)[0];
         const fullKey = data.farms.templates[options.optionTemplateFull]
@@ -2412,6 +2783,7 @@ window.FarmGod.Main = (function (Library, Translation) {
           });
         }
 
+        fgSimulationLogLifecycle(lifecycleSummary);
         fgSimulationLogDiagnostics(plan, recordsBefore + count);
         if (smartCleanup && (smartCleanup.clearedScouts || smartCleanup.clearedWalls || smartCleanup.changedWalls)) {
           fgSimulationAddLog('Gesamtplan aktualisiert: ' + fgBuildSmartRefreshMessage(smartCleanup));
@@ -3224,7 +3596,7 @@ window.FarmGod.Main = (function (Library, Translation) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.5.5</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.7.0</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
