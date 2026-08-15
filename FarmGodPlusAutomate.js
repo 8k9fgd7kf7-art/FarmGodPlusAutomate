@@ -1,4 +1,4 @@
-// FarmGod+ v2.8.0 – Report-Fetch-Debug / Simulations-Autopilot
+// FarmGod+ v2.8.1 – Simulierter Mauer-Cleaner-Lebenszyklus / Simulations-Autopilot
 (function (__FGW) {
   'use strict';
   if (!__FGW || !__FGW.game_data || !__FGW.jQuery) {
@@ -1223,12 +1223,9 @@ window.FarmGod.Main = (function (Library, Translation) {
 
   
   const fgReportDebugLog = function (message) {
-    try {
-      if (typeof fgSimulationAddLog === 'function') fgSimulationAddLog('🧪 Report-Debug · ' + message);
-      else console.log('FarmGod+ Report-Debug:', message);
-    } catch (e) {
-      console.log('FarmGod+ Report-Debug:', message);
-    }
+    // Die Report-Diagnose hat ihren Zweck erfüllt. Für weitere Fehlersuche bleibt sie
+    // in der Browser-Konsole verfügbar, ohne das Simulationsprotokoll zu fluten.
+    try { console.debug('FarmGod+ Report-Debug:', message); } catch (e) {}
   };
 
   const fgDebugReportHtml = function (reportId, html, targetCoord) {
@@ -2220,7 +2217,8 @@ const fgWallbreakerStatusLabel = function (status) {
     if (status === 'armed_bb') return '🛡️ BB mit Truppen';
     if (status === 'needs_wallbreaker') return '🔨 Mauer-Cleaner nötig';
     if (status === 'wall_waiting_troops') return '🟠 Mauerziel – wartet auf Truppen';
-    if (status === 'wall_waiting_report') return '🟣 Mauer-Cleaner simuliert';
+    if (status === 'wall_cleaner_outbound') return '🟠 Mauer-Cleaner unterwegs';
+    if (status === 'wall_waiting_report') return '🟣 wartet auf neuen Bericht';
     if (status === 'not_barbarian') return '🚫 kein BB mehr';
     if (status === 'safe') return '✅ farmbar';
     return '❔ unbekannt';
@@ -2670,6 +2668,7 @@ const fgWallbreakerStatusLabel = function (status) {
       wallTargets: 0,
       scoutPlanned: [],
       wallbreakersPlanned: [],
+      wallbreakersArrived: [],
       wallbreakerDiagnostics: [],
       released: 0
     };
@@ -2698,19 +2697,83 @@ const fgWallbreakerStatusLabel = function (status) {
           return;
         }
 
-        if (row.loss) {
-          summary.lossTargets++;
-          old.lossDetectedAt = old.lossDetectedAt || now;
-
-          // Wenn derselbe Bericht bereits als "Mauer-Cleaner simuliert" behandelt wurde,
-          // warten wir auf einen neuen Bericht / eine neue Mauerinformation und schicken
-          // in der Simulation nicht bei jedem Refresh noch einen Cleaner.
-          if (old.status === 'wall_waiting_report' &&
-              row.reportId && row.reportId === old.wallbreakerSourceReportId) {
+        // Vollständiger Simulations-Lebenszyklus des Mauer-Cleaners:
+        // abgeschickt -> unterwegs -> angekommen -> auf NEUEN Bericht warten -> neu bewerten.
+        if (old.status === 'wall_cleaner_outbound') {
+          const nowSec = Math.round(lib.getCurrentServerTime() / 1000);
+          const arrivalSec = Number(old.wallbreakerArrivalAt || 0);
+          if (arrivalSec > nowSec) {
             targets[coord] = old;
             if (data.farms && data.farms.farms) delete data.farms.farms[coord];
             return;
           }
+
+          old.status = 'wall_waiting_report';
+          old.wallbreakerArrivedAt = now;
+          old.nextCheckAt = null;
+          old.updatedAt = now;
+          summary.wallbreakersArrived.push({
+            coord: coord,
+            originCoord: old.wallbreakerOriginCoord || '?',
+            wallLevel: parseInt(old.wallLevel, 10) || 0,
+            arrivalAt: arrivalSec || nowSec
+          });
+        }
+
+        // Nach einem simulierten Cleaner wird ausschließlich ein NEUER Bericht ausgewertet.
+        // Der alte Verlustbericht darf niemals einen zweiten Cleaner auslösen.
+        if (old.status === 'wall_waiting_report') {
+          const hasNewReport = !!(row.reportId && row.reportId !== old.wallbreakerSourceReportId);
+          if (!hasNewReport || !row.reportHref) {
+            targets[coord] = old;
+            if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+            return;
+          }
+
+          targets[coord] = old;
+          if (data.farms && data.farms.farms) delete data.farms.farms[coord];
+          reportChecks.push(
+            fgFetchLifecycleReportInfo(row).then(function (info) {
+              old.lastInspectedReportId = row.reportId;
+              old.lastReportDefUnits = info.known ? info.total : null;
+              if (info.wallKnown) {
+                old.lastWallLevel = info.wallLevel;
+                old.lastWallSource = info.wallSource || 'bericht';
+              }
+
+              const wall = fgResolveLifecycleWallLevel(row, old, info);
+              old.resolvedWallLevel = wall.known ? wall.level : null;
+              old.resolvedWallSource = wall.source;
+
+              if (!info.known) {
+                old.status = 'needs_scout';
+                old.nextCheckAt = now;
+              } else if (info.total > 0) {
+                old.status = 'armed_bb';
+                old.nextCheckAt = now;
+                old.armedDetectedAt = now;
+              } else if (wall.known && wall.level > 0) {
+                old.status = 'needs_wallbreaker';
+                old.wallLevel = wall.level;
+                old.nextCheckAt = now;
+              } else if (wall.known && wall.level === 0) {
+                old.status = 'safe';
+                old.nextCheckAt = null;
+                old.lastSafeReportId = row.reportId;
+                summary.released++;
+              } else {
+                old.status = 'needs_scout';
+                old.nextCheckAt = now;
+              }
+              old.updatedAt = Date.now();
+            })
+          );
+          return;
+        }
+
+        if (row.loss) {
+          summary.lossTargets++;
+          old.lossDetectedAt = old.lossDetectedAt || now;
 
           const storedWallKnown = Number.isFinite(parseInt(old.lastWallLevel, 10));
           const defenderCountKnownZero = Number(old.lastReportDefUnits) === 0;
@@ -2720,7 +2783,7 @@ const fgWallbreakerStatusLabel = function (status) {
             : (storedWallKnown ? parseInt(old.lastWallLevel, 10) : null);
 
           // WICHTIG: Bekannter Verlustbericht mit 0 Verteidigern + sicher bekannter Mauer
-          // muss direkt in den Mauer-Cleaner-Zweig. In v2.8.0 wurde vorher pauschal
+          // muss direkt in den Mauer-Cleaner-Zweig. In v2.8.1 wurde vorher pauschal
           // needs_scout gesetzt; bei bereits bekanntem Bericht wurde dieser danach nicht
           // erneut geladen, sodass der Cleaner-Zweig nie erreicht werden konnte.
           if (defenderCountKnownZero && Number.isFinite(knownWallLevel)) {
@@ -2820,6 +2883,7 @@ const fgWallbreakerStatusLabel = function (status) {
              old.status === 'armed_bb' ||
              old.status === 'needs_wallbreaker' ||
              old.status === 'wall_waiting_troops' ||
+             old.status === 'wall_cleaner_outbound' ||
              old.status === 'wall_waiting_report') &&
             row.reportId && row.reportId !== old.lastSafeReportId && row.color === 'green') {
           old.status = 'safe';
@@ -2844,11 +2908,12 @@ const fgWallbreakerStatusLabel = function (status) {
               item.status === 'armed_bb' ||
               item.status === 'needs_wallbreaker' ||
               item.status === 'wall_waiting_troops' ||
+              item.status === 'wall_cleaner_outbound' ||
               item.status === 'wall_waiting_report') {
             if (data.farms && data.farms.farms) delete data.farms.farms[coord];
             summary.blocked++;
             if (item.status === 'armed_bb') summary.armed++;
-            if (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_troops' || item.status === 'wall_waiting_report') summary.wallTargets++;
+            if (item.status === 'needs_wallbreaker' || item.status === 'wall_waiting_troops' || item.status === 'wall_cleaner_outbound' || item.status === 'wall_waiting_report') summary.wallTargets++;
           }
         });
 
@@ -2914,10 +2979,15 @@ const fgWallbreakerStatusLabel = function (status) {
               sourceReportId: item.lastInspectedReportId || null
             });
 
-            item.status = 'wall_waiting_report';
+            item.status = 'wall_cleaner_outbound';
             item.nextCheckAt = null;
             item.lastWallbreakerAt = now;
             item.wallbreakerSourceReportId = item.lastInspectedReportId || null;
+            item.wallbreakerArrivalAt = travel.arrivalAt;
+            item.wallbreakerReturnAt = travel.returnAt;
+            item.wallbreakerOriginId = chosen.village.id;
+            item.wallbreakerOriginCoord = chosen.village.coord;
+            item.wallbreakerUnits = Object.assign({}, chosen.units);
             item.updatedAt = Date.now();
 
             summary.wallbreakersPlanned.push({
@@ -3016,9 +3086,17 @@ const fgWallbreakerStatusLabel = function (status) {
       }
     });
 
+    (summary.wallbreakersArrived || []).forEach(function (item) {
+      fgSimulationAddLog(
+        '  🟣 Mauer-Cleaner angekommen · ' + item.coord +
+        ' · Mauer ' + item.wallLevel +
+        ' · wartet jetzt auf einen neuen Bericht'
+      );
+    });
+
     (summary.wallbreakersPlanned || []).forEach(function (item, index) {
       fgSimulationAddLog(
-        '  🔨 #' + (index + 1) + ' · Mauer-Cleaner · Mauer ' + item.wallLevel +
+        '  📤 #' + (index + 1) + ' · Mauer-Cleaner simuliert abgeschickt · Mauer ' + item.wallLevel +
         ' · ' + item.originCoord + ' → ' + item.coord +
         ' · ' + item.distance.toFixed(2) + ' Felder · ' +
         item.units.axe + ' Axt / ' + item.units.ram + ' Rammen / ' + item.units.spy + ' Späher' +
@@ -4124,7 +4202,7 @@ const fgWallbreakerStatusLabel = function (status) {
         @media(max-width:700px){.fg-grid,.fg-common-grid{grid-template-columns:1fr}.fg-profile-row{grid-template-columns:1fr 1fr}.fg-profile-row .btn{width:100%}}
       </style>
       <div class="fg-wrap">
-        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.8.0</div></div>
+        <div class="fg-head"><div class="fg-title">FarmGod+</div><div class="fg-version">v2.8.1</div></div>
         <div class="fg-body optionsContent">
           <div class="fgIntegratedStatus">${fgBuildIntegratedStatusHtml()}</div>
           ${fgWarnings.length
